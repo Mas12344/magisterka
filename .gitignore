@@ -1,6 +1,8 @@
 dataset_merged.npy
 dataset_stats.json
 training_history.png
+autoencoder_results.png
+training_history.json
 __pycache__/
 checkpoints/
 mlruns/
