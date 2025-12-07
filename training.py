@@ -9,12 +9,44 @@ import mlflow.pytorch
 
 from autoencoder import combined_loss, calculate_metrics
 
+from torch_lr_finder import LRFinder
+
+import torch.nn as nn
+class LRFinderLoss(nn.Module):
+    def __init__(self, mse, l1, fft):
+        super().__init__()
+        self.mse = mse
+        self.l1 = l1
+        self.fft = fft
+
+    def forward(self, pred, target):
+        pred, _ = pred
+        return combined_loss(pred, target, mse_weight=self.mse, l1_weight=self.l1, fft_weight=self.fft)[0]
+
+
+def find_lr(model, trainloader, device):
+    mse_w = 1.0
+    l1_w  = 1.0
+    fft_w = 1.0
+    criterion = LRFinderLoss(mse_w,l1_w,fft_w)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-7, weight_decay=0.01)
+    lr_finder = LRFinder(model, optimizer, criterion, device=device)
+    lr_finder.range_test(trainloader, end_lr=100, num_iter=1000)
+    lr_finder.plot()
+    lr_finder.reset()
+
 
 def train_autoencoder(model, train_loader, val_loader, config, device):
     num_epochs = config['num_epochs']
     lr = config['learning_rate']
+    min_lr = config.get('min_lr', 1e-6)
     optimizer = optim.AdamW(model.parameters(), lr=lr,
                             weight_decay=config.get('weight_decay', 0.01))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs,
+        eta_min=min_lr
+    )
     mixed_precision = config.get('mixed_precision', False)
     scaler = GradScaler('cuda') if mixed_precision else None
 
@@ -39,6 +71,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
     mlflow.log_params({
         'num_epochs': num_epochs,
         'learning_rate': lr,
+        'min_lr': min_lr,
         'latent_dim': config.get('latent_dim'),
         'mse_weight': mse_w,
         'l1_weight': l1_w,
@@ -52,8 +85,10 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
     history = {k: [] for k in [
         'train_loss', 'val_loss', 'train_mse', 'train_l1', 'train_fft',
         'val_mse', 'val_l1', 'val_fft', 'train_psnr', 'train_mae',
-        'val_psnr', 'val_mae'
+        'val_psnr', 'val_mae', 'lr'
     ]}
+
+
 
     for epoch in range(num_epochs):
         model.train()
@@ -86,6 +121,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             for k in train_metrics:
                 train_metrics[k] += metrics[k]
 
+        scheduler.step()
         n = len(train_loader)
         avg_train = {k: v / n for k, v in train_losses.items()}
         avg_metrics = {k: v / n for k, v in train_metrics.items()}
@@ -96,13 +132,15 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         history['train_fft'].append(avg_train['fft'])
         history['train_psnr'].append(avg_metrics['psnr'])
         history['train_mae'].append(avg_metrics['mae'])
+        history['lr'].append(scheduler.get_last_lr()[0])
 
         val_results = validate(model, val_loader, mse_w, l1_w, fft_w, device, mixed_precision)
         for k, v in val_results.items():
             history[k].append(v)
 
         print(f"Epoch [{epoch+1}/{num_epochs}] "
-              f"Train Loss: {avg_train['total']:.6f}, Val Loss: {val_results['val_loss']:.6f}")
+              f"Train Loss: {avg_train['total']:.6f}, Val Loss: {val_results['val_loss']:.6f}, "
+              f"LR: {scheduler.get_last_lr()[0]:.6e}")
 
         if (epoch + 1) % save_every == 0:
             path = os.path.join(checkpoint_dir, f'model_epoch_{epoch+1}.pth')

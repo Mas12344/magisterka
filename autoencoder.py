@@ -4,14 +4,25 @@ import torch.nn.functional as F
 
 
 def fft_loss(pred, target):
-    pred_fft = torch.fft.rfft2(pred)
-    target_fft = torch.fft.rfft2(target)
+    pred_fft = torch.fft.rfft(pred, dim=3)
+    target_fft = torch.fft.rfft(target, dim=3)
+
     pred_mag = torch.abs(pred_fft)
     target_mag = torch.abs(target_fft)
+    
+    scale = target_mag.max()
+
+    pred_mag /= scale
+    target_mag /= scale
+
+    if pred_mag.isnan().any() or target_mag.isnan().any():
+        print(scale)
+        exit()
+
     return torch.mean((pred_mag - target_mag) ** 2)
 
 
-def combined_loss(pred, target, mse_weight=1.0, l1_weight=0.1, fft_weight=0.1):
+def combined_loss(pred, target, mse_weight=1.0, l1_weight=1.0, fft_weight=1.0):
     mse_loss = F.mse_loss(pred, target)
     l1_loss = F.l1_loss(pred, target)
     fft_component = fft_loss(pred, target)
