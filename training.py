@@ -87,7 +87,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         'val_mse', 'val_l1', 'val_fft', 'train_psnr', 'train_mae',
         'val_psnr', 'val_mae', 'lr'
     ]}
-
+    global_step = 0
 
 
     for epoch in range(num_epochs):
@@ -121,6 +121,18 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             for k in train_metrics:
                 train_metrics[k] += metrics[k]
 
+            mlflow.log_metrics({
+                "step/train_loss": parts.get("total", loss.item()),
+                "step/train_mse": parts.get("mse"),
+                "step/train_l1": parts.get("l1"),
+                "step/train_fft": parts.get("fft"),
+                "step/train_psnr": metrics["psnr"],
+                "step/train_mae": metrics["mae"],
+                "step/lr": scheduler.get_last_lr()[0],
+            }, step=global_step)
+
+            global_step += 1
+
         scheduler.step()
         n = len(train_loader)
         avg_train = {k: v / n for k, v in train_losses.items()}
@@ -137,6 +149,23 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         val_results = validate(model, val_loader, mse_w, l1_w, fft_w, device, mixed_precision)
         for k, v in val_results.items():
             history[k].append(v)
+
+        mlflow.log_metrics({
+            "epoch/train_loss": avg_train["total"],
+            "epoch/train_mse": avg_train["mse"],
+            "epoch/train_l1": avg_train["l1"],
+            "epoch/train_fft": avg_train["fft"],
+            "epoch/train_psnr": avg_metrics["psnr"],
+            "epoch/train_mae": avg_metrics["mae"],
+            "epoch/lr": scheduler.get_last_lr()[0],
+
+            "epoch/val_loss": val_results["val_loss"],
+            "epoch/val_mse": val_results["val_mse"],
+            "epoch/val_l1": val_results["val_l1"],
+            "epoch/val_fft": val_results["val_fft"],
+            "epoch/val_psnr": val_results["val_psnr"],
+            "epoch/val_mae": val_results["val_mae"],
+        }, step=epoch)
 
         print(f"Epoch [{epoch+1}/{num_epochs}] "
               f"Train Loss: {avg_train['total']:.6f}, Val Loss: {val_results['val_loss']:.6f}, "

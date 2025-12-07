@@ -10,7 +10,7 @@ def fft_loss(pred, target):
     pred_mag = torch.abs(pred_fft)
     target_mag = torch.abs(target_fft)
     
-    scale = target_mag.max()
+    scale = torch.mode(torch.flatten(target_mag))[0]
 
     pred_mag /= scale
     target_mag /= scale
@@ -112,3 +112,8 @@ class StrainRateAutoencoder(nn.Module):
         latent = self.encode(x)
         reconstructed = self.decode(latent)
         return reconstructed, latent
+
+
+if __name__ == '__main__':
+    pred, target = torch.rand([1, 1, 512, 512]), torch.rand([1, 1, 512, 512])
+    fft_loss(pred, target)

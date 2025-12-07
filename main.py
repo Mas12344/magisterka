@@ -18,34 +18,34 @@ class MyDataLoaderIter(TrainDataLoaderIter):
 
 def lr_range_test():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataset = MemmapDataset("dataset_merged.npy", "dataset_stats.json", custom_size=10000)
+    dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy")
     n_total = len(dataset)
     n_train = int(0.8 * n_total)
     train_ds, val_ds = random_split(dataset, [n_train, n_total - n_train])
     train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
-    model = StrainRateAutoencoder(latent_dim=2048, use_batchnorm=False, dropout_rate=0.05)
+    model = StrainRateAutoencoder(latent_dim=2048, use_batchnorm=False, dropout_rate=0.005)
     find_lr(model, MyDataLoaderIter(train_loader), device)
 
 
 def main():
     config = {
         'batch_size': 16,
-        'learning_rate': 1e-4,
+        'learning_rate': 1.34E-07,
         'min_lr': 2e-8,
         'weight_decay': 0.01,
-        'num_epochs': 50000,
+        'num_epochs': 500,
         
         'latent_dim': 2048,
         
-        'mse_weight': .1,
-        'l1_weight': .1,
-        'fft_weight': .3,
+        'mse_weight': 0.1,
+        'l1_weight': 0.5,
+        'fft_weight': 0.2,
         
         'mixed_precision': False,
         'save_every': 10000,
         'use_tensorboard': True,
         'project_name': 'ae-training-combined-loss',
-        'run_name': f'cosineannealing_scheduler_{int(time.time())}',
+        'run_name': f'fft_mode_scale_dropout_005_nie_wiem_jak_czytac_lrfinder_lepsze_wagi_{int(time.time())}',
     }
 
 
@@ -59,10 +59,10 @@ def main():
         train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
         model = StrainRateAutoencoder(latent_dim=config['latent_dim'],
-                                      use_batchnorm=False, dropout_rate=0.05)
+                                      use_batchnorm=False, dropout_rate=0.005)
 
         history = train_autoencoder(model, train_loader, val_loader, config, device)
-        results = run_inference_with_metrics(model, train_loader, device)
+        results = run_inference_with_metrics(model, train_loader, config, device)
 
         visualize_results(results[:3], 'autoencoder_results.png')
         plot_training_history(history, 'training_history.png')
@@ -92,7 +92,7 @@ def inf_test():
 
     dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy", custom_size=20)
     device = "cuda"
-    model = StrainRateAutoencoder(latent_dim=2048, use_batchnorm=False, dropout_rate=0.05)
+    model = StrainRateAutoencoder(latent_dim=2048, use_batchnorm=False, dropout_rate=0.005)
 
     state_dict = torch.load(r"I:\magisterka\clean\checkpoints\ae-training-combined-loss\cosineannealing_scheduler_1765106910\final_model.pth")['model_state_dict']
     model.load_state_dict(state_dict)
@@ -130,7 +130,7 @@ def inf_test():
 
 
 if __name__ == '__main__':
-    #main()
+    main()
     #lr_range_test()
     #search()
-    inf_test()
+    #inf_test()

@@ -43,6 +43,6 @@ class PickleDataset(Dataset):
             metric, arr = pickle.load(f)
 
         arr = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)
-        #metric = torch.tensor(metric, dtype=torch.float32)
-
-        return arr#, metric
+        if arr.shape != torch.Size([1, 512, 512]):
+            return self[(idx+1)%self.n_samples]
+        return arr
