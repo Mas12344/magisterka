@@ -1,6 +1,7 @@
 import json
 import numpy as np
 import torch
+from torchvision.transforms import v2
 from torch.utils.data import Dataset
 import pickle
 
@@ -24,10 +25,11 @@ class MemmapDataset(Dataset):
 
 
 class PickleDataset(Dataset):
-    def __init__(self, pickle_path, index_path, custom_size=None):
+    def __init__(self, pickle_path, index_path, input_size, custom_size=None):
         self.pickle_path = pickle_path
         self.offsets = np.load(index_path, mmap_mode='r')
         self.n_samples = len(self.offsets)
+        self.transform = v2.Resize((input_size, input_size))
 
         if custom_size is None:
             self.custom_size = self.n_samples
@@ -43,6 +45,10 @@ class PickleDataset(Dataset):
             metric, arr = pickle.load(f)
 
         arr = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)
-        if arr.shape != torch.Size([1, 512, 512]):
-            return self[(idx+1)%self.n_samples]
-        return arr
+        while arr.shape != torch.Size([1, 512, 512]):
+            arr = self[(idx+1)%self.n_samples]
+        return self.transform(arr)
+
+if __name__ == '__main__':
+    dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy", 128, custom_size=20)
+    print(dataset[0].shape)

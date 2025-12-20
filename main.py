@@ -29,37 +29,46 @@ def lr_range_test():
 
 def main():
     config = {
-        'batch_size': 16,
+        'input_size': 128,
+        'batch_size': 256,
         'learning_rate': 1.34E-07,
-        'min_lr': 2e-8,
         'weight_decay': 0.01,
-        'num_epochs': 500,
+        'use_adaptive_lr': True,
+        'min_lr': 1e-9,
+        'max_lr': 2,
+        'adaptive_method': 'relative',
+        'target_ratio': 1e-3,
+        'curvature_damping': 1e-6,
+        'lr_ema_beta': 0.9,
+        'use_layernorm': True,
+
+        'num_epochs': 50,
         
         'latent_dim': 2048,
         
-        'mse_weight': 0.1,
-        'l1_weight': 0.5,
-        'fft_weight': 0.2,
+        'mse_weight': 1.0,
+        'l1_weight': 0.0,
+        'fft_weight': 0.0,
         
         'mixed_precision': False,
         'save_every': 10000,
         'use_tensorboard': True,
         'project_name': 'ae-training-combined-loss',
-        'run_name': f'fft_mode_scale_dropout_005_nie_wiem_jak_czytac_lrfinder_lepsze_wagi_{int(time.time())}',
+        'run_name': f'adaptacyjny_lr_{int(time.time())}',
     }
 
 
     mlflow.set_experiment(config['project_name'])
     with mlflow.start_run(run_name=config['run_name']):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy", custom_size=20)
+        dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy", config['input_size'], 256*4)
         n_total = len(dataset)
         n_train = int(0.8 * n_total)
         train_ds, val_ds = random_split(dataset, [n_train, n_total - n_train])
         train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
-        model = StrainRateAutoencoder(latent_dim=config['latent_dim'],
-                                      use_batchnorm=False, dropout_rate=0.005)
+        model = StrainRateAutoencoder(input_size=config['input_size'], latent_dim=config['latent_dim'],
+                                      use_layernorm=config['use_layernorm'], dropout_rate=0.005)
 
         history = train_autoencoder(model, train_loader, val_loader, config, device)
         results = run_inference_with_metrics(model, train_loader, config, device)
