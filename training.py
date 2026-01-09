@@ -82,7 +82,9 @@ class AdaptiveLR(Optimizer):
         ema_beta=0.9,
         min_lr=1e-6,
         max_lr=1.0,
-        use_curvature=True
+        use_curvature=True,
+        lr_change_limit=2.0,
+        curvature_scale=0.3
     ):
         super().__init__(params, defaults={})
 
@@ -92,6 +94,7 @@ class AdaptiveLR(Optimizer):
         self.min_lr = min_lr
         self.max_lr = max_lr
         self.use_curvature = use_curvature
+        self.curvature_scale = curvature_scale
 
         self.state["lr_ema"] = None
         self.state["last_lr"] = None
@@ -131,12 +134,12 @@ class AdaptiveLR(Optimizer):
 
     def _ema_lr(self, lr):
         if self.state["lr_ema"] is None:
-            self.state["lr_ema"] = lr
+            self.state["lr_ema"] = lr.detach()
         else:
             self.state["lr_ema"] = (
                 self.ema_beta * self.state["lr_ema"]
                 + (1 - self.ema_beta) * lr
-            )
+            ).detach()
         return self.state["lr_ema"]
 
 
@@ -146,29 +149,44 @@ class AdaptiveLR(Optimizer):
 
         params = self.param_groups[0]["params"]
         params = [p for p in params if p.requires_grad]
-        torch.nn.utils.clip_grad_norm_(params, 10.0)
 
         lr_rel = self._lr_from_relative_step(params)
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+
+        lr = lr_rel
+        gHg = None
 
         if self.use_curvature:
-            lr_curv, gHg = self._lr_from_gHg(loss, params)
-            lr = min(lr_rel, lr_curv)
-            self.state["last_gHg"] = gHg.item()
+            lr_curv, gHg_val = self._lr_from_gHg(loss, params)
+            
+            if gHg_val is not None and gHg_val > 0 and torch.isfinite(lr_curv):
+                lr = torch.minimum(lr_rel, self.curvature_scale * lr_curv)
+                gHg = gHg_val
+            
+            self.state["last_gHg"] = gHg.item() if gHg is not None else None
         else:
             lr = lr_rel
             self.state["last_gHg"] = None
 
+
+        prev_lr = self.state["last_lr"]
+        if prev_lr is not None:
+            lr = torch.minimum(lr, prev_lr)
+        
+        if prev_lr is not None:
+            lr = self._ema_lr(lr)
+        else:
+            self._ema_lr(lr)
+
+        if prev_lr is not None:
+            lower = prev_lr / 2
+            upper = prev_lr ** 2
+            lr = torch.clamp(lr, lower, upper)
+
         lr = torch.clamp(lr, self.min_lr, self.max_lr)
-        lr = self._ema_lr(lr.item())
-
-        with torch.no_grad():
-            for p in params:
-                if p.grad is not None:
-                    p.add_(p.grad, alpha=-lr)
-
-        self.state["last_lr"] = lr
+        
+        self.state["last_lr"] = lr.detach()
         return loss, rest
-
 
 
 
@@ -183,15 +201,20 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
     min_lr = config.get('min_lr', 1e-9)
     max_lr = config.get('max_lr', 2)
 
+    adam = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-3,          # placeholder
+        weight_decay=config['weight_decay']
+    )
 
-    optimizer = AdaptiveLR(
+    adaptive_lr = AdaptiveLR(
         model.parameters(),
         target_ratio=target_ratio,
         damping=curvature_damping,
         ema_beta=lr_ema_beta,
-        min_lr=1e-6,
-        max_lr=1.0,
-        use_curvature=False
+        min_lr=min_lr,
+        max_lr=max_lr,
+        use_curvature=(adaptive_method != 'relative')
     )
 
     mixed_precision = config.get('mixed_precision', False)
@@ -235,7 +258,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
     history = {k: [] for k in [
         'train_loss', 'val_loss', 'train_mse', 'train_l1', 'train_fft',
         'val_mse', 'val_l1', 'val_fft', 'train_psnr', 'train_mae',
-        'val_psnr', 'val_mae', 'lr', 'grad_norm', 'gHg_norm'
+        'val_psnr', 'val_mae', 'lr', 'grad_norm', 'gHg_norm', 'lr_ema'
     ]}
 
     global_step = 0
@@ -249,6 +272,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         train_losses = {'total': 0, 'mse': 0, 'l1': 0, 'fft': 0}
         train_metrics = {'psnr': 0, 'mae': 0}
         epoch_lrs = []
+        epoch_ema = []
         epoch_grad_norms = []
         epoch_gHg_norms = []
         epoch_grad_similarities = []
@@ -259,26 +283,30 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             if len(data.shape) == 3:
                 data = data.unsqueeze(1)
 
-            def closure():
-                optimizer.zero_grad()
+            adam.zero_grad()
 
+            def closure():
                 out, _ = model(data)
                 loss, parts = combined_loss(out, data, mse_w, l1_w, fft_w)
                 loss.backward(
                     retain_graph=adaptive_method in ['curvature', 'hybrid'],
                 )
-
                 assert loss.requires_grad
-
                 return loss, (parts, out)
 
-            loss, (parts, out) = optimizer.step(closure)
+            loss, (parts, out) = adaptive_lr.step(closure)
+
+            lr = adaptive_lr.state["last_lr"]
+            for g in adam.param_groups:
+                g["lr"] = lr
+
 
             if mixed_precision:
                 scaler.update()
 
-            current_lr = optimizer.state["last_lr"]
-            gHg_value = optimizer.state["last_gHg"]
+            current_lr = adaptive_lr.state["last_lr"]
+            gHg_value = adaptive_lr.state["last_gHg"]
+            ema_value = adaptive_lr.state["lr_ema"]
 
             current_grad = flatten_grads(model.parameters())
             grad_norm = current_grad.norm().item()
@@ -288,6 +316,9 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                 epoch_grad_similarities.append(grad_similarity)
 
             layer_norms = compute_layer_grad_norms(model)
+            
+            adam.step()
+            #adam.zero_grad()
 
             for k in train_losses:
                 train_losses[k] += parts.get(k, loss.item())
@@ -296,6 +327,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                 train_metrics[k] += metrics[k]
 
             epoch_lrs.append(current_lr)
+            epoch_ema.append(ema_value)
             epoch_grad_norms.append(grad_norm)
             if gHg_value is not None:
                 epoch_gHg_norms.append(abs(gHg_value))
@@ -308,7 +340,8 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                 "step/train_psnr": metrics["psnr"],
                 "step/train_mae": metrics["mae"],
                 "step/lr": current_lr,
-                "step/grad_norm": grad_norm
+                "step/grad_norm": grad_norm,
+                "step/lr_ema": ema_value
             }
 
             if grad_similarity is not None:
@@ -327,6 +360,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         avg_train = {k: v / n for k, v in train_losses.items()}
         avg_metrics = {k: v / n for k, v in train_metrics.items()}
         avg_lr = sum(epoch_lrs)/n
+        avg_ema = sum(epoch_ema)/n
         avg_grad_norm = sum(epoch_grad_norms)/n
 
         history['train_loss'].append(avg_train['total'])
@@ -335,8 +369,9 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         history['train_fft'].append(avg_train['fft'])
         history['train_psnr'].append(avg_metrics['psnr'])
         history['train_mae'].append(avg_metrics['mae'])
-        history['lr'].append(avg_lr)
+        history['lr'].append(avg_lr.item())
         history['grad_norm'].append(avg_grad_norm)
+        history['lr_ema'].append(avg_ema.item())
 
         if epoch_gHg_norms:
             avg_gHg = sum(epoch_gHg_norms)/n
@@ -346,6 +381,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         for k, v in val_results.items():
             history[k].append(v)
 
+
         epoch_metrics = {
             "epoch/train_loss": avg_train["total"],
             "epoch/train_mse": avg_train["mse"],
@@ -354,6 +390,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             "epoch/train_psnr": avg_metrics["psnr"],
             "epoch/train_mae": avg_metrics["mae"],
             "epoch/lr": avg_lr,
+            "epoch/lr_ema": avg_ema,
             "epoch/grad_norm": avg_grad_norm,
             "epoch/val_loss": val_results["val_loss"],
             "epoch/val_mse": val_results["val_mse"],

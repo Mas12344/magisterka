@@ -1,6 +1,7 @@
 dataset_merged.npy
 dataset_stats.json
 *.png
+*.pdf
 training_history.json
 __pycache__/
 checkpoints/
