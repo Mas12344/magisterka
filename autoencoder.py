@@ -44,8 +44,18 @@ def combined_loss(pred, target, mse_weight=1.0, l1_weight=1.0, fft_weight=1.0):
         'mse': mse_loss.item() * mse_weight,
         'l1': l1_loss.item() * l1_weight,
         'fft': fft_component.item() * fft_weight,
-        'total': total_loss.item(),
+        'recon': total_loss.item(),
     }
+
+
+def vae_loss(pred, target, mu, logvar, mse_weight=1.0, l1_weight=1.0, fft_weight=1.0, kl_weight=0.5, contrastive_weight=0):
+    recon_loss, stats = combined_loss(pred, target, mse_weight, l1_weight, fft_weight)
+    kl_loss = -.5 * torch.sum(1+logvar - mu.pow(2) - logvar.exp())
+    contrastive_loss = torch.tensor(1) # TODO
+
+    total = recon_loss + kl_weight * kl_loss + contrastive_weight * contrastive_loss
+    stats.update({'total': total.item(),'kl': kl_loss.item() * kl_weight, 'contrastive': contrastive_weight * contrastive_loss.item()})
+    return total, stats
 
 
 def calculate_metrics(pred, target):
@@ -56,9 +66,9 @@ def calculate_metrics(pred, target):
     return {'psnr': psnr.item(), 'mae': mae.item()}
 
 
-class StrainRateAutoencoder(nn.Module):
+class StrainRateVAE(nn.Module):
     def __init__(self, input_size=512, latent_dim=2048, use_layernorm=True, dropout_rate=0.05):
-        super(StrainRateAutoencoder, self).__init__()
+        super(StrainRateVAE, self).__init__()
 
         self.latent_dim = latent_dim
         self.use_layernorm = use_layernorm
@@ -70,7 +80,8 @@ class StrainRateAutoencoder(nn.Module):
 
         self.encoder = self._build_encoder()
         self.flatten_size = self.final_channels * self.final_spatial_size * self.final_spatial_size
-        self.fc_encode = nn.Linear(self.flatten_size, latent_dim)
+        self.fc_encode_mu = nn.Linear(self.flatten_size, latent_dim)
+        self.fc_encode_logvar = nn.Linear(self.flatten_size, latent_dim)
         self.fc_decode = nn.Linear(latent_dim, self.flatten_size)
         self.decoder = self._build_decoder()
 
@@ -134,10 +145,18 @@ class StrainRateAutoencoder(nn.Module):
             layers += self._deconv_block(channels[i], channels[i + 1])
         return nn.Sequential(*layers)
 
+    def reparam(self, mu, logvar):
+        std = torch.exp(logvar/2)
+        eps = torch.randn_like(std)
+        z = mu + std * eps
+        return z
+
     def encode(self, x):
         x = self.encoder(x)
         x = x.view(x.size(0), -1)
-        return self.fc_encode(x)
+        mu = self.fc_encode_mu(x)
+        logvar = self.fc_encode_logvar(x)
+        return mu, logvar
 
     def decode(self, latent):
         x = self.fc_decode(latent)
@@ -145,21 +164,23 @@ class StrainRateAutoencoder(nn.Module):
         return self.decoder(x)
 
     def forward(self, x):
-        latent = self.encode(x)
+        mu, logvar = self.encode(x)
+        latent = self.reparam(mu, logvar)
         reconstructed = self.decode(latent)
-        return reconstructed, latent
+        return reconstructed, latent, mu, logvar
 
 
 if __name__ == '__main__':
     pred, target = torch.rand([1, 1, 512, 512]), torch.rand([1, 1, 512, 512])
     fft_loss(pred, target)
-    srae = StrainRateAutoencoder()
+    srae = StrainRateVAE()
     channels = [1, 32, 64, 128, 256, 512]
     spatial_size = 128
     for i in range(len(channels) - 1):
         spatial_size = srae._calculate_output_size(spatial_size)
         print(spatial_size)
 
-    loss = combined_loss(pred, target)
+    reconstructed, latent, mu, logvar = srae(target)
+    loss = vae_loss(reconstructed, target, mu, logvar)
     print(loss)
 

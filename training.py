@@ -9,7 +9,7 @@ import mlflow
 import mlflow.pytorch
 
 
-from autoencoder import combined_loss, calculate_metrics
+from autoencoder import vae_loss, combined_loss, calculate_metrics
 
 from torch_lr_finder import LRFinder
 
@@ -73,148 +73,35 @@ def compute_gradient_similarity(current_grad, prev_grad):
     return cos_sim
 
 
-class AdaptiveLR(Optimizer):
-    def __init__(
-        self,
-        params,
-        target_ratio=1e-3,
-        damping=1e-6,
-        ema_beta=0.9,
-        min_lr=1e-6,
-        max_lr=1.0,
-        use_curvature=True,
-        lr_change_limit=2.0,
-        curvature_scale=0.3
-    ):
-        super().__init__(params, defaults={})
+class BetaScheduler:
+    def __init__(self, cycle_length, type="linear", proportion=None):
+        self.i = 0
+        self.cycle_length = cycle_length
+        self.proportion = max(min(proportion,1),0)
+        if type == "linear":
+            self.f = lambda : self.i/self.cycle_length
+        elif type == "half":
+            self.f = lambda : min(1,self.i/(self.cycle_length*self.proportion))
 
-        self.target_ratio = target_ratio
-        self.damping = damping
-        self.ema_beta = ema_beta
-        self.min_lr = min_lr
-        self.max_lr = max_lr
-        self.use_curvature = use_curvature
-        self.curvature_scale = curvature_scale
+    def step(self):
+        self.i += 1
+        self.i %= (self.cycle_length+1)
 
-        self.state["lr_ema"] = None
-        self.state["last_lr"] = None
-        self.state["last_gHg"] = None
-
-    def _lr_from_relative_step(self, params, eps=1e-12):
-        g = flatten_grads(params)
-        w = flatten_params(params)
-        return self.target_ratio * (w.norm() / (g.norm() + eps))
-
-    def _lr_from_gHg(self, loss, params):
-        params = [p for p in params if p.requires_grad]
-
-        grads = torch.autograd.grad(
-            loss,
-            params,
-            create_graph=True,
-            retain_graph=True
-        )
-
-        g = torch.cat([gi.flatten() for gi in grads])
-        assert g.requires_grad
-
-        Hv = torch.autograd.grad(
-            outputs=g,
-            inputs=params,
-            grad_outputs=g,
-            retain_graph=True
-        )
-
-        Hv_flat = torch.cat([h.flatten() for h in Hv])
-        gHg = torch.dot(g, Hv_flat)
-
-        lr = g.norm()**2 / (gHg + self.damping)
-        return lr, gHg
-
-
-    def _ema_lr(self, lr):
-        if self.state["lr_ema"] is None:
-            self.state["lr_ema"] = lr.detach()
-        else:
-            self.state["lr_ema"] = (
-                self.ema_beta * self.state["lr_ema"]
-                + (1 - self.ema_beta) * lr
-            ).detach()
-        return self.state["lr_ema"]
-
-
-    def step(self, closure):
-        with torch.enable_grad():
-            loss, rest = closure()
-
-        params = self.param_groups[0]["params"]
-        params = [p for p in params if p.requires_grad]
-
-        lr_rel = self._lr_from_relative_step(params)
-        torch.nn.utils.clip_grad_norm_(params, 1.0)
-
-        lr = lr_rel
-        gHg = None
-
-        if self.use_curvature:
-            lr_curv, gHg_val = self._lr_from_gHg(loss, params)
-            
-            if gHg_val is not None and gHg_val > 0 and torch.isfinite(lr_curv):
-                lr = torch.minimum(lr_rel, self.curvature_scale * lr_curv)
-                gHg = gHg_val
-            
-            self.state["last_gHg"] = gHg.item() if gHg is not None else None
-        else:
-            lr = lr_rel
-            self.state["last_gHg"] = None
-
-
-        prev_lr = self.state["last_lr"]
-        if prev_lr is not None:
-            lr = torch.minimum(lr, prev_lr)
-        
-        if prev_lr is not None:
-            lr = self._ema_lr(lr)
-        else:
-            self._ema_lr(lr)
-
-        if prev_lr is not None:
-            lower = prev_lr / 2
-            upper = prev_lr ** 2
-            lr = torch.clamp(lr, lower, upper)
-
-        lr = torch.clamp(lr, self.min_lr, self.max_lr)
-        
-        self.state["last_lr"] = lr.detach()
-        return loss, rest
-
+    def get_beta(self):
+        return self.f()
 
 
 def train_autoencoder(model, train_loader, val_loader, config, device):
     num_epochs = config['num_epochs']
     
-    use_adaptive_lr = config.get('use_adaptive_lr', True)
-    adaptive_method = config.get('adaptive_method', 'relative')
-    target_ratio = config.get('target_ratio', 1e-3)
-    curvature_damping = config.get('curvature_damping', 1e-6)
-    lr_ema_beta = config.get('lr_ema_beta', 0.9)
-    min_lr = config.get('min_lr', 1e-9)
-    max_lr = config.get('max_lr', 2)
-
-    adam = torch.optim.AdamW(
-        model.parameters(),
-        lr=1e-3,          # placeholder
-        weight_decay=config['weight_decay']
-    )
-
-    adaptive_lr = AdaptiveLR(
-        model.parameters(),
-        target_ratio=target_ratio,
-        damping=curvature_damping,
-        ema_beta=lr_ema_beta,
-        min_lr=min_lr,
-        max_lr=max_lr,
-        use_curvature=(adaptive_method != 'relative')
+    lr = config['learning_rate']
+    min_lr = config.get('min_lr', 1e-6)
+    optimizer = optim.AdamW(model.parameters(), lr=lr,
+                            weight_decay=config.get('weight_decay', 0.01))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs,
+        eta_min=min_lr
     )
 
     mixed_precision = config.get('mixed_precision', False)
@@ -223,6 +110,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
     mse_w = config.get('mse_weight', 1.0)
     l1_w = config.get('l1_weight', 0.1)
     fft_w = config.get('fft_weight', 1.0)
+    con_w = config.get('contrastive_weight', 0.0)
 
     save_every = config.get('save_every', 50)
     project_name = config.get('project_name', 'autoencoder')
@@ -240,11 +128,9 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
 
     mlflow.log_params({
         'num_epochs': num_epochs,
-        'use_adaptive_lr': use_adaptive_lr,
-        'adaptive_method': adaptive_method,
-        'target_ratio': target_ratio,
-        'lr_ema_beta': lr_ema_beta,
         'latent_dim': config.get('latent_dim'),
+        'learning_rate': lr,
+        'min_lr': min_lr,
         'mse_weight': mse_w,
         'l1_weight': l1_w,
         'fft_weight': fft_w,
@@ -256,25 +142,21 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
 
     model.to(device)
     history = {k: [] for k in [
-        'train_loss', 'val_loss', 'train_mse', 'train_l1', 'train_fft',
-        'val_mse', 'val_l1', 'val_fft', 'train_psnr', 'train_mae',
-        'val_psnr', 'val_mae', 'lr', 'grad_norm', 'gHg_norm', 'lr_ema'
+        'train_loss', 'val_loss', 'train_recon', 'train_mse', 'train_l1', 'train_fft', 'train_kl', 'train_contrastive'
+        'val_recon', 'val_mse', 'val_l1', 'val_fft', 'val_kl', 'val_contrastive', 'train_psnr', 'train_mae',
+        'val_psnr', 'val_mae', 'lr', 'grad_norm'
     ]}
 
     global_step = 0
     prev_grad = None
-
-    print(f"training with adaptive LR (method: {adaptive_method})")
-
+    beta_sch = BetaScheduler(num_epochs//2, "half", 0.5)
 
     for epoch in range(num_epochs):
         model.train()
         train_losses = {'total': 0, 'mse': 0, 'l1': 0, 'fft': 0}
         train_metrics = {'psnr': 0, 'mae': 0}
         epoch_lrs = []
-        epoch_ema = []
         epoch_grad_norms = []
-        epoch_gHg_norms = []
         epoch_grad_similarities = []
 
         for batch_idx, data in enumerate(train_loader):
@@ -283,30 +165,20 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             if len(data.shape) == 3:
                 data = data.unsqueeze(1)
 
-            adam.zero_grad()
-
-            def closure():
-                out, _ = model(data)
-                loss, parts = combined_loss(out, data, mse_w, l1_w, fft_w)
-                loss.backward(
-                    retain_graph=adaptive_method in ['curvature', 'hybrid'],
-                )
-                assert loss.requires_grad
-                return loss, (parts, out)
-
-            loss, (parts, out) = adaptive_lr.step(closure)
-
-            lr = adaptive_lr.state["last_lr"]
-            for g in adam.param_groups:
-                g["lr"] = lr
-
+            optimizer.zero_grad()
 
             if mixed_precision:
+                with autocast('cuda'):
+                    out, _, mu, logvar, = model(data)
+                    loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, beta_sch.get_beta(), con_w)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
                 scaler.update()
-
-            current_lr = adaptive_lr.state["last_lr"]
-            gHg_value = adaptive_lr.state["last_gHg"]
-            ema_value = adaptive_lr.state["lr_ema"]
+            else:
+                out, _, mu, logvar, = model(data)
+                loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, beta_sch.get_beta(), con_w)
+                loss.backward()
+                optimizer.step()
 
             current_grad = flatten_grads(model.parameters())
             grad_norm = current_grad.norm().item()
@@ -317,8 +189,6 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
 
             layer_norms = compute_layer_grad_norms(model)
             
-            adam.step()
-            #adam.zero_grad()
 
             for k in train_losses:
                 train_losses[k] += parts.get(k, loss.item())
@@ -327,27 +197,24 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                 train_metrics[k] += metrics[k]
 
             epoch_lrs.append(current_lr)
-            epoch_ema.append(ema_value)
             epoch_grad_norms.append(grad_norm)
-            if gHg_value is not None:
-                epoch_gHg_norms.append(abs(gHg_value))
 
             step_metrics = {
                 "step/train_loss": parts.get("total", loss.item()),
+                "step/train_recon": parts.get("recon"),
                 "step/train_mse": parts.get("mse"),
                 "step/train_l1": parts.get("l1"),
                 "step/train_fft": parts.get("fft"),
+                "step/train_kl": parts.get("kl"),
+                "step/train_contrastive": parts.get("contrastive"),
                 "step/train_psnr": metrics["psnr"],
                 "step/train_mae": metrics["mae"],
                 "step/lr": current_lr,
                 "step/grad_norm": grad_norm,
-                "step/lr_ema": ema_value
             }
 
             if grad_similarity is not None:
                 step_metrics["step/grad_similarity"] = grad_similarity
-            if gHg_value is not None:
-                step_metrics["step/gHg"] = abs(gHg_value)
 
             step_metrics.update(layer_norms)
             mlflow.log_metrics(step_metrics, step=global_step)
@@ -356,54 +223,59 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             global_step += 1
 
 
+        scheduler.step()
         n = len(train_loader)
         avg_train = {k: v / n for k, v in train_losses.items()}
         avg_metrics = {k: v / n for k, v in train_metrics.items()}
         avg_lr = sum(epoch_lrs)/n
-        avg_ema = sum(epoch_ema)/n
         avg_grad_norm = sum(epoch_grad_norms)/n
 
         history['train_loss'].append(avg_train['total'])
+        history['train_recon'].append(avg_train['recon'])
         history['train_mse'].append(avg_train['mse'])
         history['train_l1'].append(avg_train['l1'])
         history['train_fft'].append(avg_train['fft'])
+        history['train_kl'].append(avg_train['kl'])
+        history['train_contrastive'].append(avg_train['contrastive'])
         history['train_psnr'].append(avg_metrics['psnr'])
         history['train_mae'].append(avg_metrics['mae'])
         history['lr'].append(avg_lr.item())
         history['grad_norm'].append(avg_grad_norm)
-        history['lr_ema'].append(avg_ema.item())
 
-        if epoch_gHg_norms:
-            avg_gHg = sum(epoch_gHg_norms)/n
-            history['gHg_norm'].append(avg_gHg)
 
-        val_results = validate(model, val_loader, mse_w, l1_w, fft_w, device, mixed_precision)
+        val_results = validate(model, val_loader, mse_w, l1_w, fft_w, beta_sch.get_beta(), con_w, device, mixed_precision)
+        
+        beta_sch.step()
+
         for k, v in val_results.items():
             history[k].append(v)
 
 
         epoch_metrics = {
             "epoch/train_loss": avg_train["total"],
+            "epoch/train_recon": avg_train["recon"],
             "epoch/train_mse": avg_train["mse"],
             "epoch/train_l1": avg_train["l1"],
             "epoch/train_fft": avg_train["fft"],
+            "epoch/train_kl": avg_train["kl"],
+            "epoch/train_contrastive": avg_train["contrastive"],
             "epoch/train_psnr": avg_metrics["psnr"],
             "epoch/train_mae": avg_metrics["mae"],
             "epoch/lr": avg_lr,
-            "epoch/lr_ema": avg_ema,
             "epoch/grad_norm": avg_grad_norm,
             "epoch/val_loss": val_results["val_loss"],
+            "epoch/val_recon": val_results["val_recon"],
             "epoch/val_mse": val_results["val_mse"],
             "epoch/val_l1": val_results["val_l1"],
             "epoch/val_fft": val_results["val_fft"],
+            "epoch/val_kl": val_results["val_kl"],
+            "epoch/val_contrastive": val_results["val_contrastive"],
             "epoch/val_psnr": val_results["val_psnr"],
             "epoch/val_mae": val_results["val_mae"],
         }
 
         if epoch_grad_similarities:
             epoch_metrics["epoch/grad_similarity"] = sum(epoch_grad_similarities)/n
-        if epoch_gHg_norms:
-            epoch_metrics["epoch/gHg"] = avg_gHg
         
         mlflow.log_metrics(epoch_metrics, step=epoch)
 
@@ -431,9 +303,9 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
     return history
 
 
-def validate(model, loader, mse_w, l1_w, fft_w, device, mixed_precision):
+def validate(model, loader, mse_w, l1_w, fft_w, kl_w, con_w, device, mixed_precision):
     model.eval()
-    losses = {'total': 0, 'mse': 0, 'l1': 0, 'fft': 0}
+    losses = {'total': 0, 'recon': 0, 'mse': 0, 'l1': 0, 'fft': 0, 'kl': 0, 'contrastive': 0}
     metrics = {'psnr': 0, 'mae': 0}
 
     with torch.no_grad():
@@ -445,11 +317,11 @@ def validate(model, loader, mse_w, l1_w, fft_w, device, mixed_precision):
 
             if mixed_precision:
                 with autocast('cuda'):
-                    out, _ = model(data)
-                    loss, parts = combined_loss(out, data, mse_w, l1_w, fft_w)
+                    out, _, mu, logvar, = model(data)
+                    loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, kl_w, con_w)
             else:
-                out, _ = model(data)
-                loss, parts = combined_loss(out, data, mse_w, l1_w, fft_w)
+                out, _, mu, logvar, = model(data)
+                loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, kl_w, con_w)
 
             for k in losses:
                 losses[k] += parts.get(k, loss.item())
@@ -460,9 +332,20 @@ def validate(model, loader, mse_w, l1_w, fft_w, device, mixed_precision):
     n = len(loader)
     return {
         'val_loss': losses['total'] / n,
+        'val_recon': losses['recon'] / n,
         'val_mse': losses['mse'] / n,
         'val_l1': losses['l1'] / n,
         'val_fft': losses['fft'] / n,
+        'val_kl': losses['kl'] / n,
+        'val_contrastive': losses['contrastive'] / n,
         'val_psnr': metrics['psnr'] / n,
         'val_mae': metrics['mae'] / n,
     }
+
+
+if __name__ == '__main__':
+    
+    b = BetaScheduler(97, "half", 0.5)
+    for _ in range(20):
+        print(b.get_beta())
+        [b.step() for _ in range(10)]
