@@ -1,7 +1,7 @@
 import os
 import time
 import torch
-from torch.optim import Optimizer
+import torch.optim as optim
 from torch import autograd
 from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
@@ -93,6 +93,7 @@ class BetaScheduler:
 
 def train_autoencoder(model, train_loader, val_loader, config, device):
     num_epochs = config['num_epochs']
+    beta_sch = BetaScheduler(num_epochs//2, "half", 0.5)
     
     lr = config['learning_rate']
     min_lr = config.get('min_lr', 1e-6)
@@ -142,18 +143,17 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
 
     model.to(device)
     history = {k: [] for k in [
-        'train_loss', 'val_loss', 'train_recon', 'train_mse', 'train_l1', 'train_fft', 'train_kl', 'train_contrastive'
+        'train_loss', 'val_loss', 'train_recon', 'train_mse', 'train_l1', 'train_fft', 'train_kl', 'train_contrastive',
         'val_recon', 'val_mse', 'val_l1', 'val_fft', 'val_kl', 'val_contrastive', 'train_psnr', 'train_mae',
         'val_psnr', 'val_mae', 'lr', 'grad_norm'
     ]}
 
     global_step = 0
     prev_grad = None
-    beta_sch = BetaScheduler(num_epochs//2, "half", 0.5)
 
     for epoch in range(num_epochs):
         model.train()
-        train_losses = {'total': 0, 'mse': 0, 'l1': 0, 'fft': 0}
+        train_losses = {'total': 0, 'recon': 0, 'mse': 0, 'l1': 0, 'fft': 0, 'kl': 0, 'contrastive': 0}
         train_metrics = {'psnr': 0, 'mae': 0}
         epoch_lrs = []
         epoch_grad_norms = []
@@ -196,6 +196,8 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             for k in train_metrics:
                 train_metrics[k] += metrics[k]
 
+
+            current_lr = optimizer.param_groups[0]['lr']
             epoch_lrs.append(current_lr)
             epoch_grad_norms.append(grad_norm)
 
@@ -239,7 +241,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         history['train_contrastive'].append(avg_train['contrastive'])
         history['train_psnr'].append(avg_metrics['psnr'])
         history['train_mae'].append(avg_metrics['mae'])
-        history['lr'].append(avg_lr.item())
+        history['lr'].append(avg_lr)
         history['grad_norm'].append(avg_grad_norm)
 
 
