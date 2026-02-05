@@ -1,6 +1,7 @@
 import os
 import time
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 import torch.optim as optim
 from torch import autograd
 from torch.amp import GradScaler, autocast
@@ -228,7 +229,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
 
         for batch_idx, data in enumerate(train_loader):
             data = data[0] if isinstance(data, (list, tuple)) else data
-            data = data.to(device)
+            data = data.to(device, non_blocking=True)
             if len(data.shape) == 3:
                 data = data.unsqueeze(1)
 
@@ -247,9 +248,9 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                         mse_w, l1_w, fft_w, 
                         current_beta, 
                         con_w,
-                        z1=proj1,
-                        z2=proj2,
-                        temperature=contrastive_temperature
+                        proj1,
+                        proj2,
+                        contrastive_temperature
                     )
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -264,9 +265,9 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                     mse_w, l1_w, fft_w, 
                     current_beta, 
                     con_w,
-                    z1=proj1,
-                    z2=proj2,
-                    temperature=contrastive_temperature
+                    proj1,
+                    proj2,
+                    contrastive_temperature
                 )
                 loss.backward()
                 optimizer.step()
@@ -337,7 +338,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         history['grad_norm'].append(avg_grad_norm)
 
 
-        val_results = validate(model, val_loader, mse_w, l1_w, fft_w, current_beta, con_w, device, mixed_precision)
+        val_results = validate(model, val_loader, mse_w, l1_w, fft_w, current_beta, con_w, contrastive_temperature, augmentation_noise_std, device, mixed_precision)
 
         if best_val > val_results['val_loss']:
             best_val = val_results['val_loss']
@@ -404,7 +405,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
     return history
 
 
-def validate(model, loader, mse_w, l1_w, fft_w, kl_w, con_w, device, mixed_precision):
+def validate(model, loader, mse_w, l1_w, fft_w, kl_w, con_w, contrastive_temperature, augmentation_noise_std, device, mixed_precision):
     model.eval()
     losses = {'total': 0, 'recon': 0, 'mse': 0, 'l1': 0, 'fft': 0, 'kl': 0, 'contrastive': 0}
     metrics = {'psnr': 0, 'mae': 0}
@@ -418,11 +419,15 @@ def validate(model, loader, mse_w, l1_w, fft_w, kl_w, con_w, device, mixed_preci
 
             if mixed_precision:
                 with autocast('cuda'):
-                    out, _, mu, logvar, = model(data)
-                    loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, kl_w, con_w)
+                    out, _, mu, logvar, proj1 = model(data, return_projection=True)
+                    data_aug = augment_with_noise(data, noise_std=augmentation_noise_std)
+                    _, _, _, _, proj2 = model(data_aug, return_projection=True)
+                    loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, kl_w, con_w, proj1, proj2, contrastive_temperature)
             else:
-                out, _, mu, logvar, = model(data)
-                loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, kl_w, con_w)
+                out, _, mu, logvar, proj1 = model(data, return_projection=True)
+                data_aug = augment_with_noise(data, noise_std=augmentation_noise_std)
+                _, _, _, _, proj2 = model(data_aug, return_projection=True)
+                loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, kl_w, con_w, proj1, proj2, contrastive_temperature)
 
             for k in losses:
                 losses[k] += parts.get(k, loss.item())
@@ -442,6 +447,63 @@ def validate(model, loader, mse_w, l1_w, fft_w, kl_w, con_w, device, mixed_preci
         'val_psnr': metrics['psnr'] / n,
         'val_mae': metrics['mae'] / n,
     }
+
+
+def profile_training(model, train_loader):
+    with profile(
+        activities=[
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=3,
+            repeat=1
+        ),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+
+        device = "cuda"
+        model.to(device)
+        for epoch in range(1):
+            for batch_idx, data in enumerate(train_loader):
+                if batch_idx >= 5:
+                    break
+                
+                data = data.to(device, non_blocking=True)
+            
+                with record_function("forward"):
+                    out, _, mu, logvar, proj1 = model(data, return_projection=True)
+                    data_aug = augment_with_noise(data, noise_std=0.02)
+                    _, _, _, _, proj2 = model(data_aug, return_projection=True)
+
+                with record_function("loss_calculation"):
+                    loss, parts = vae_loss(
+                        out, data, mu, logvar, 
+                        0, 1, 0, 
+                        0, 
+                        0,
+                        z1=proj1,
+                        z2=proj2,
+                        temperature=0.5
+                    )
+                
+                with record_function("backward"):
+                    optimizer.zero_grad()
+                    loss.backward()
+                
+                with record_function("optimizer_step"):
+                    optimizer.step()
+                
+                prof.step()
+    
+    print("Profiling complete! Check TensorBoard")
 
 
 if __name__ == '__main__':

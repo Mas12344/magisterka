@@ -108,11 +108,11 @@ def calculate_metrics(pred, target):
 
 
 class StrainRateVAE(nn.Module):
-    def __init__(self, input_size=512, latent_dim=2048, use_batchnorm=True, dropout_rate=0.0):
+    def __init__(self, input_size=512, latent_dim=2048, use_layernorm=True, dropout_rate=0.0):
         super(StrainRateVAE, self).__init__()
 
         self.latent_dim = latent_dim
-        self.use_batchnorm = use_batchnorm 
+        self.use_layernorm = use_layernorm 
         self.dropout_rate = dropout_rate
         self.input_size = input_size
 
@@ -142,7 +142,7 @@ class StrainRateVAE(nn.Module):
                 nn.init.kaiming_normal_(m.weight, a=0.2, mode='fan_in', nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
@@ -163,7 +163,7 @@ class StrainRateVAE(nn.Module):
         new_size = self._calculate_output_size(spatial_size)
         layers.append(nn.LeakyReLU(0.2))
         if use_bn:
-            layers.append(nn.BatchNorm2d(out_ch))
+            layers.append(nn.LayerNorm([out_ch, new_size, new_size]))
         if dropout > 0:
             layers.append(nn.Dropout2d(dropout))
         return layers, new_size
@@ -176,25 +176,22 @@ class StrainRateVAE(nn.Module):
             block_layers, spatial_size = self._conv_block(
                 channels[i], channels[i + 1],
                 spatial_size,
-                self.use_batchnorm,
+                self.use_layernorm,
                 self.dropout_rate
             )
             layers += block_layers
         return nn.Sequential(*layers)
 
     def _deconv_block(self, in_ch, out_ch, is_last=False):
-        if is_last:
-            return [
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                nn.Conv2d(in_ch, out_ch, 3, padding=1),
+        layers = [
+            nn.Conv2d(in_ch, out_ch * 4, kernel_size=3, padding=1),
+            nn.PixelShuffle(2)
+        ]
 
-            ]
-        else:
-            return [
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                nn.Conv2d(in_ch, out_ch, 3, padding=1),
-                nn.LeakyReLU(0.2)
-            ]
+        if not is_last:
+            layers.append(nn.LeakyReLU(0.2))
+
+        return layers
 
     def _build_decoder(self):
         layers = []
@@ -272,3 +269,60 @@ if __name__ == '__main__':
         z1=proj1, z2=proj2, temperature=0.5
     )
     print("Loss z contrastive:", loss_contrastive)
+
+    import time
+    model = StrainRateVAE(input_size=128, latent_dim=2048).cuda()
+    model.eval()
+
+    dummy_input = torch.randn(32, 1, 128, 128).cuda()
+    with torch.no_grad():
+        # Encoder
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(100):
+            x = model.encoder(dummy_input)
+        torch.cuda.synchronize()
+        print(f"Encoder (5x Conv): {(time.time()-t0)/100*1000:.1f}ms")
+        
+        # Flatten + FC encode
+        x_flat = x.view(x.size(0), -1)
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(100):
+            mu = model.fc_encode_mu(x_flat)
+            logvar = model.fc_encode_logvar(x_flat)
+        torch.cuda.synchronize()
+        print(f"FC encode (2x Linear): {(time.time()-t0)/100*1000:.1f}ms")
+        
+        # Reparametrization
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(100):
+            z = model.reparam(mu, logvar)
+        torch.cuda.synchronize()
+        print(f"Reparametrization: {(time.time()-t0)/100*1000:.1f}ms")
+        
+        # FC decode
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(100):
+            x_dec = model.fc_decode(z)
+        torch.cuda.synchronize()
+        print(f"FC decode (1x Linear): {(time.time()-t0)/100*1000:.1f}ms")
+        
+        # Decoder
+        x_reshaped = x_dec.view(x_dec.size(0), 512, 8, 8)
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(100):
+            recon = model.decoder(x_reshaped)
+        torch.cuda.synchronize()
+        print(f"Decoder (5x Upsample+Conv): {(time.time()-t0)/100*1000:.1f}ms")
+        
+        # Full forward
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(100):
+            recon, latent, mu, logvar = model(dummy_input)
+        torch.cuda.synchronize()
+        print(f"\nFull forward pass: {(time.time()-t0)/100*1000:.1f}ms")

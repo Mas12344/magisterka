@@ -3,10 +3,11 @@ import json
 import mlflow
 import numpy as np
 import torch
+
 from torch.utils.data import DataLoader, random_split
 
 from autoencoder import StrainRateVAE
-from training import train_autoencoder, find_lr
+from training import train_autoencoder, find_lr, profile_training
 from inference import run_inference_with_metrics
 from visualization import visualize_results, plot_training_history
 from dataset import *
@@ -30,19 +31,19 @@ def lr_range_test():
 def main():
     config = {
         'input_size': 128,
-        'batch_size': 512,
-        'learning_rate': 1.34E-04,
+        'batch_size': 256,
+        'learning_rate': 2E-04,
         'weight_decay': 0.01,
 
-        'min_lr': 1e-7,
+        'min_lr': 1e-9,
 
         'use_layernorm': True,
-        'num_epochs': 1000,
+        'num_epochs': 2000,
         'latent_dim': 2048,
         
-        'mse_weight': 2.0,
-        'l1_weight': 2.0,
-        'fft_weight': 0.1,
+        'mse_weight': 1.0,
+        'l1_weight': 1.0,
+        'fft_weight': 0.0,
         'contrastive_weight' : 0.1,
         'augmentation_noise_std': 0.02,
         'contrastive_temperature': 0.5,
@@ -62,16 +63,26 @@ def main():
     mlflow.set_experiment(config['project_name'])
     with mlflow.start_run(run_name=config['run_name']):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy", config['input_size'], 3200)
+        dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy", config['input_size'], 320)
         n_total = len(dataset)
         n_train = int(0.8 * n_total)
         train_ds, val_ds = random_split(dataset, [n_train, n_total - n_train])
-        train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
+        train_loader = DataLoader(
+            train_ds, 
+            batch_size=config["batch_size"], 
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
+            drop_last=True
+        )
         val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
         model = StrainRateVAE(input_size=config['input_size'], latent_dim=config['latent_dim'],
-                                      use_batchnorm=config['use_layernorm'], dropout_rate=0.005)
-
+                                      use_layernorm=config['use_layernorm'], dropout_rate=0.005)
+    
         history = train_autoencoder(model, train_loader, val_loader, config, device)
+
         results = run_inference_with_metrics(model, train_loader, config, device)
 
         visualize_results(results[:3], 'autoencoder_results.png')
