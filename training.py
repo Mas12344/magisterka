@@ -7,9 +7,9 @@ from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 import mlflow
 import mlflow.pytorch
+import math
 
-
-from autoencoder import vae_loss, combined_loss, calculate_metrics
+from autoencoder import vae_loss, combined_loss, calculate_metrics, augment_with_noise
 
 from torch_lr_finder import LRFinder
 
@@ -74,26 +74,93 @@ def compute_gradient_similarity(current_grad, prev_grad):
 
 
 class BetaScheduler:
-    def __init__(self, cycle_length, type="linear", proportion=None):
-        self.i = 0
-        self.cycle_length = cycle_length
-        self.proportion = max(min(proportion,1),0)
-        if type == "linear":
-            self.f = lambda : self.i/self.cycle_length
-        elif type == "half":
-            self.f = lambda : min(1,self.i/(self.cycle_length*self.proportion))
+    def __init__(self, 
+                 total_steps,
+                 schedule='cyclical',
+                 beta_start=0.0,
+                 beta_end=1.0,
+                 n_cycles=4,
+                 ratio=0.5,
+                 warmup_steps=0):
 
+        self.total_steps = total_steps
+        self.schedule = schedule
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        self.n_cycles = n_cycles
+        self.ratio = ratio
+        self.warmup_steps = warmup_steps
+        self.step_count = 0
+        
     def step(self):
-        self.i += 1
-        self.i %= (self.cycle_length+1)
-
+        self.step_count += 1
+        
     def get_beta(self):
-        return self.f()
+        if self.step_count < self.warmup_steps:
+            return 0.0
+            
+        adjusted_step = self.step_count - self.warmup_steps
+        adjusted_total = self.total_steps - self.warmup_steps
+        
+        if self.schedule == 'constant':
+            beta = self.beta_end
+            
+        elif self.schedule == 'linear':
+            beta = self.beta_start + (self.beta_end - self.beta_start) * \
+                   min(1.0, adjusted_step / adjusted_total)
+                   
+        elif self.schedule == 'cyclical':
+            # Cyclical Annealing Schedule
+            cycle_len = adjusted_total / self.n_cycles
+            cycle_pos = adjusted_step % cycle_len
+            
+            if cycle_pos < cycle_len * self.ratio:
+                # Faza wzrostu
+                beta = self.beta_start + (self.beta_end - self.beta_start) * \
+                       (cycle_pos / (cycle_len * self.ratio))
+            else:
+                # Faza stała
+                beta = self.beta_end
+                
+        elif self.schedule == 'monotonic':
+            # Monotonic annealing
+            tau = adjusted_step / adjusted_total
+            beta = self.beta_start + (self.beta_end - self.beta_start) * \
+                   (1 - math.exp(-5 * tau))
+                   
+        elif self.schedule == 'cosine':
+            # Cosine annealing
+            tau = adjusted_step / adjusted_total
+            beta = self.beta_start + (self.beta_end - self.beta_start) * \
+                   (1 - math.cos(tau * math.pi)) / 2
+                   
+        else:
+            beta = self.beta_end
+            
+        return beta
+    
+    def get_schedule_info(self):
+        return {
+            'schedule': self.schedule,
+            'current_step': self.step_count,
+            'current_beta': self.get_beta(),
+            'beta_range': (self.beta_start, self.beta_end)
+        }
 
 
 def train_autoencoder(model, train_loader, val_loader, config, device):
     num_epochs = config['num_epochs']
-    beta_sch = BetaScheduler(num_epochs//2, "half", 0.5)
+    steps_per_epoch = len(train_loader)
+    total_steps = num_epochs * steps_per_epoch
+    beta_sch = BetaScheduler(
+        total_steps=total_steps,
+        schedule=config.get('beta_schedule', 'cosine'),
+        beta_start=0.0,
+        beta_end=config.get('max_beta', 1.0),
+        n_cycles=config.get('beta_cycles', 4),
+        ratio=0.5,
+        warmup_steps=steps_per_epoch * config.get('beta_warmup_epochs', 2)
+    )
     
     lr = config['learning_rate']
     min_lr = config.get('min_lr', 1e-6)
@@ -111,7 +178,9 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
     mse_w = config.get('mse_weight', 1.0)
     l1_w = config.get('l1_weight', 0.1)
     fft_w = config.get('fft_weight', 1.0)
-    con_w = config.get('contrastive_weight', 0.0)
+    con_w = config.get('contrastive_weight', 0.1)
+    augmentation_noise_std = config.get('augmentation_noise_std', 0.02)
+    contrastive_temperature = config.get('contrastive_temperature', 0.5)
 
     save_every = config.get('save_every', 50)
     project_name = config.get('project_name', 'autoencoder')
@@ -127,29 +196,27 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         os.makedirs(log_dir, exist_ok=True)
         writer = SummaryWriter(log_dir)
 
-    mlflow.log_params({
-        'num_epochs': num_epochs,
-        'latent_dim': config.get('latent_dim'),
-        'learning_rate': lr,
-        'min_lr': min_lr,
-        'mse_weight': mse_w,
-        'l1_weight': l1_w,
-        'fft_weight': fft_w,
+
+    mlflow_params = config
+    mlflow_params.update({
         'input_size': getattr(model, 'input_size', None),
         'dropout_rate': getattr(model, 'dropout_rate', None),
         'use_layernorm': getattr(model, 'use_layernorm', None),
         'device': str(device),
     })
+    mlflow.log_params(mlflow_params)
 
     model.to(device)
     history = {k: [] for k in [
         'train_loss', 'val_loss', 'train_recon', 'train_mse', 'train_l1', 'train_fft', 'train_kl', 'train_contrastive',
         'val_recon', 'val_mse', 'val_l1', 'val_fft', 'val_kl', 'val_contrastive', 'train_psnr', 'train_mae',
-        'val_psnr', 'val_mae', 'lr', 'grad_norm'
+        'val_psnr', 'val_mae', 'lr', 'grad_norm', 'beta'
     ]}
 
     global_step = 0
     prev_grad = None
+
+    best_val = float('inf')
 
     for epoch in range(num_epochs):
         model.train()
@@ -167,16 +234,40 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
 
             optimizer.zero_grad()
 
+            current_beta = beta_sch.get_beta()
+
             if mixed_precision:
                 with autocast('cuda'):
-                    out, _, mu, logvar, = model(data)
-                    loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, beta_sch.get_beta(), con_w)
+                    out, _, mu, logvar, proj1 = model(data, return_projection=True)
+                    data_aug = augment_with_noise(data, noise_std=augmentation_noise_std)
+                    _, _, _, _, proj2 = model(data_aug, return_projection=True)
+
+                    loss, parts = vae_loss(
+                        out, data, mu, logvar, 
+                        mse_w, l1_w, fft_w, 
+                        current_beta, 
+                        con_w,
+                        z1=proj1,
+                        z2=proj2,
+                        temperature=contrastive_temperature
+                    )
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                out, _, mu, logvar, = model(data)
-                loss, parts = vae_loss(out, data, mu, logvar, mse_w, l1_w, fft_w, beta_sch.get_beta(), con_w)
+                out, _, mu, logvar, proj1 = model(data, return_projection=True)
+                data_aug = augment_with_noise(data, noise_std=augmentation_noise_std)
+                _, _, _, _, proj2 = model(data_aug, return_projection=True)
+
+                loss, parts = vae_loss(
+                    out, data, mu, logvar, 
+                    mse_w, l1_w, fft_w, 
+                    current_beta, 
+                    con_w,
+                    z1=proj1,
+                    z2=proj2,
+                    temperature=contrastive_temperature
+                )
                 loss.backward()
                 optimizer.step()
 
@@ -213,6 +304,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                 "step/train_mae": metrics["mae"],
                 "step/lr": current_lr,
                 "step/grad_norm": grad_norm,
+                "step/beta" : current_beta,
             }
 
             if grad_similarity is not None:
@@ -245,7 +337,14 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         history['grad_norm'].append(avg_grad_norm)
 
 
-        val_results = validate(model, val_loader, mse_w, l1_w, fft_w, beta_sch.get_beta(), con_w, device, mixed_precision)
+        val_results = validate(model, val_loader, mse_w, l1_w, fft_w, current_beta, con_w, device, mixed_precision)
+
+        if best_val > val_results['val_loss']:
+            best_val = val_results['val_loss']
+            path = os.path.join(checkpoint_dir, f'best_model.pth')
+            torch.save({'model_state_dict': model.state_dict()}, path)
+            mlflow.log_artifact(path, artifact_path="checkpoints")
+
         
         beta_sch.step()
 
@@ -346,8 +445,4 @@ def validate(model, loader, mse_w, l1_w, fft_w, kl_w, con_w, device, mixed_preci
 
 
 if __name__ == '__main__':
-    
-    b = BetaScheduler(97, "half", 0.5)
-    for _ in range(20):
-        print(b.get_beta())
-        [b.step() for _ in range(10)]
+    pass

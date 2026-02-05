@@ -29,6 +29,7 @@ class PickleDataset(Dataset):
         self.pickle_path = pickle_path
         self.offsets = np.load(index_path, mmap_mode='r')
         self.n_samples = len(self.offsets)
+
         self.transform = v2.Resize((input_size, input_size))
 
         if custom_size is None:
@@ -46,9 +47,12 @@ class PickleDataset(Dataset):
 
         arr = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)
         while arr.shape != torch.Size([1, 512, 512]):
-            arr = self[(idx+1)%self.n_samples]
+            idx += 1
+            arr = self[(idx)%self.n_samples]
         return self.transform(arr)
 
 if __name__ == '__main__':
     dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy", 128, custom_size=20)
     print(dataset[0].shape)
+    print(dataset[0].min())
+    print(dataset[0].max())

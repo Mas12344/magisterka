@@ -1,5 +1,5 @@
 import torch
-from autoencoder import combined_loss, calculate_metrics
+from autoencoder import vae_loss, calculate_metrics
 
 
 def run_inference_with_metrics(model, loader, config, device="cuda", max_batches=5):
@@ -10,6 +10,8 @@ def run_inference_with_metrics(model, loader, config, device="cuda", max_batches
     mse_w = config.get('mse_weight', 1.0)
     l1_w = config.get('l1_weight', 0.1)
     fft_w = config.get('fft_weight', 1.0)
+    kl_w = config.get('max_beta', 1.0)
+    contrastive_w = config.get('contrastive_weight', 1.0)
 
     with torch.no_grad():
         for i, batch in enumerate(loader):
@@ -20,9 +22,9 @@ def run_inference_with_metrics(model, loader, config, device="cuda", max_batches
             if len(x.shape) == 3:
                 x = x.unsqueeze(1)
 
-            reconstructed, latent = model(x)
+            reconstructed, latent, mu, logvar = model(x)
             metrics = calculate_metrics(reconstructed, x)
-            _, losses = combined_loss(reconstructed, x, mse_w, l1_w, fft_w)
+            _, losses = vae_loss(reconstructed, x, mu, logvar, mse_w, l1_w, fft_w, kl_w, contrastive_w)
 
             results.append({
                 'input': x[0].cpu(),

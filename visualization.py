@@ -32,6 +32,8 @@ Losses:
 MSE: {l['mse']:.6f}
 L1: {l['l1']:.6f}
 FFT: {l['fft']:.6f}
+KL: {l['kl']:.6f}
+Contrastive: {l['contrastive']:.6f}
 Total: {l['total']:.6f}"""
         axes[i, 3].text(0.1, 0.5, text, transform=axes[i, 3].transAxes,
                         fontsize=10, va='center',
