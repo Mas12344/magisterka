@@ -69,7 +69,7 @@ def main():
         train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
         model = StrainRateVAE(input_size=config['input_size'], latent_dim=config['latent_dim'],
-                                      use_layernorm=config['use_layernorm'], dropout_rate=0.005)
+                                      use_batchnorm=config['use_layernorm'], dropout_rate=0.005)
 
         history = train_autoencoder(model, train_loader, val_loader, config, device)
         results = run_inference_with_metrics(model, train_loader, config, device)

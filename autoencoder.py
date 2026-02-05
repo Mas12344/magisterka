@@ -108,11 +108,11 @@ def calculate_metrics(pred, target):
 
 
 class StrainRateVAE(nn.Module):
-    def __init__(self, input_size=512, latent_dim=2048, use_layernorm=True, dropout_rate=0.05):
+    def __init__(self, input_size=512, latent_dim=2048, use_batchnorm=True, dropout_rate=0.0):
         super(StrainRateVAE, self).__init__()
 
         self.latent_dim = latent_dim
-        self.use_layernorm = use_layernorm
+        self.use_batchnorm = use_batchnorm 
         self.dropout_rate = dropout_rate
         self.input_size = input_size
 
@@ -128,9 +128,9 @@ class StrainRateVAE(nn.Module):
 
         self.projection = nn.Sequential(
             nn.Linear(latent_dim, 1024),
-            nn.GELU(),
+            nn.LeakyReLU(0.2),
             nn.Linear(1024, 512),
-            nn.GELU(),
+            nn.LeakyReLU(0.2),
             nn.Linear(512, 256)
         )
 
@@ -139,9 +139,12 @@ class StrainRateVAE(nn.Module):
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, a=0.2, mode='fan_in', nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def _calculate_final_size(self):
         channels = [1, 32, 64, 128, 256, 512]
@@ -155,12 +158,12 @@ class StrainRateVAE(nn.Module):
     def _calculate_output_size(self, input_size, kernel_size=3, stride=2, padding=1):
         return (input_size + 2 * padding - kernel_size) // stride + 1
 
-    def _conv_block(self, in_ch, out_ch, spatial_size, use_ln, dropout):
+    def _conv_block(self, in_ch, out_ch, spatial_size, use_bn, dropout):
         layers = [nn.Conv2d(in_ch, out_ch, 3, 2, 1)]
         new_size = self._calculate_output_size(spatial_size)
-        layers.append(nn.GELU())
-        if use_ln:
-            layers.append(nn.LayerNorm([out_ch, new_size, new_size]))
+        layers.append(nn.LeakyReLU(0.2))
+        if use_bn:
+            layers.append(nn.BatchNorm2d(out_ch))
         if dropout > 0:
             layers.append(nn.Dropout2d(dropout))
         return layers, new_size
@@ -173,7 +176,7 @@ class StrainRateVAE(nn.Module):
             block_layers, spatial_size = self._conv_block(
                 channels[i], channels[i + 1],
                 spatial_size,
-                self.use_layernorm,
+                self.use_batchnorm,
                 self.dropout_rate
             )
             layers += block_layers
@@ -184,12 +187,13 @@ class StrainRateVAE(nn.Module):
             return [
                 nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
                 nn.Conv2d(in_ch, out_ch, 3, padding=1),
+
             ]
         else:
             return [
                 nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
                 nn.Conv2d(in_ch, out_ch, 3, padding=1),
-                nn.GELU()
+                nn.LeakyReLU(0.2)
             ]
 
     def _build_decoder(self):
