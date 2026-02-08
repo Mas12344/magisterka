@@ -158,11 +158,11 @@ class StrainRateVAE(nn.Module):
     def _calculate_output_size(self, input_size, kernel_size=3, stride=2, padding=1):
         return (input_size + 2 * padding - kernel_size) // stride + 1
 
-    def _conv_block(self, in_ch, out_ch, spatial_size, use_bn, dropout):
+    def _conv_block(self, in_ch, out_ch, spatial_size, use_ln, dropout):
         layers = [nn.Conv2d(in_ch, out_ch, 3, 2, 1)]
         new_size = self._calculate_output_size(spatial_size)
         layers.append(nn.LeakyReLU(0.2))
-        if use_bn:
+        if use_ln:
             layers.append(nn.LayerNorm([out_ch, new_size, new_size]))
         if dropout > 0:
             layers.append(nn.Dropout2d(dropout))
