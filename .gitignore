@@ -3,7 +3,9 @@ dataset_stats.json
 *.png
 *.pdf
 training_history.json
+export_mlflow_to_pdf.py
 __pycache__/
 checkpoints/
 mlruns/
 runs/
+profiler_logs/
