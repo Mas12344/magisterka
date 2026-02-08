@@ -38,19 +38,19 @@ def main():
         'min_lr': 1e-9,
 
         'use_layernorm': True,
-        'num_epochs': 2000,
+        'num_epochs': 2500,
         'latent_dim': 2048,
         
         'mse_weight': 1.0,
         'l1_weight': 1.0,
-        'fft_weight': 0.0,
-        'contrastive_weight' : 0.1,
-        'augmentation_noise_std': 0.02,
+        'fft_weight': 0.0125,
+        'contrastive_weight' : 0.01,
+        'augmentation_noise_std': 0.2,
         'contrastive_temperature': 0.5,
-        'max_beta' : 0.1,
-        'beta_warmup_epochs' : 2,
-        'beta_schedule' : 'constant',
-        'beta_cycles' : 4,
+        'max_beta' : 1,
+        'beta_warmup_epochs' : 20,
+        'beta_schedule' : 'cyclical',
+        'beta_cycles' : 6,
         
         'mixed_precision': True,
         'save_every': 50,
@@ -63,7 +63,7 @@ def main():
     mlflow.set_experiment(config['project_name'])
     with mlflow.start_run(run_name=config['run_name']):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy", config['input_size'], 320)
+        dataset = PickleDataset("../normalized_sorted.pkl", "../normalized_sorted_index.npy", config['input_size'], 3200)
         n_total = len(dataset)
         n_train = int(0.8 * n_total)
         train_ds, val_ds = random_split(dataset, [n_train, n_total - n_train])
