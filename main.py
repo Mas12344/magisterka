@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, random_split
 
 from autoencoder import StrainRateVAE
 from training import train_autoencoder, find_lr, profile_training
-from inference import run_inference_with_metrics
+from inference import run_inference_with_metrics, sample_random
 from visualization import visualize_results, plot_training_history
 from dataset import *
 
@@ -32,31 +32,32 @@ def main():
     config = {
         'input_size': 128,
         'batch_size': 256,
-        'learning_rate': 2E-04,
+        'learning_rate': 2E-06,
         'weight_decay': 0.01,
 
         'min_lr': 1e-9,
 
         'use_layernorm': True,
-        'num_epochs': 2500,
+        'num_epochs': 1000,
         'latent_dim': 2048,
         
         'mse_weight': 1.0,
         'l1_weight': 1.0,
-        'fft_weight': 0.0125,
-        'contrastive_weight' : 0.01,
+        'fft_weight': 0.00125,
+        'contrastive_weight' : 0.0001,
         'augmentation_noise_std': 0.2,
         'contrastive_temperature': 0.5,
-        'max_beta' : 1,
-        'beta_warmup_epochs' : 20,
-        'beta_schedule' : 'cyclical',
-        'beta_cycles' : 6,
-        
+        'max_beta' : 0.01,
+        'beta_warmup_epochs' : 0,
+        'beta_schedule' : 'sigmoid',
+        'beta_cycles' : 1,
+
+        'max_grad_norm': 1.0,
         'mixed_precision': True,
         'save_every': 50,
         'use_tensorboard': True,
         'project_name': 'vae-training',
-        'run_name': f'vae_contrastive_loss_medium_dataset_{int(time.time())}',
+        'run_name': f'vae_gradient_clip_{int(time.time())}',
     }
 
 
@@ -81,22 +82,20 @@ def main():
         model = StrainRateVAE(input_size=config['input_size'], latent_dim=config['latent_dim'],
                                       use_layernorm=config['use_layernorm'], dropout_rate=0.005)
     
-        history = train_autoencoder(model, train_loader, val_loader, config, device)
+        history, best_model_path = train_autoencoder(model, train_loader, val_loader, config, device)
+
+        model.load_state_dict(torch.load(best_model_path)['model_state_dict'])
 
         results = run_inference_with_metrics(model, train_loader, config, device)
 
-        visualize_results(results[:3], 'autoencoder_results.png')
-        plot_training_history(history, 'training_history.png')
+        random_samples = [sample_random(model, config) for _ in range(4)]
+
+        visualize_results(results[:1], random_samples, 'autoencoder_results.png')
 
         mlflow.log_metrics({
             'final_train_loss': history['train_loss'][-1],
             'final_val_loss': history['val_loss'][-1],
         })
-
-        with open('training_history.json', 'w') as f:
-            json.dump(history, f, indent=2)
-        mlflow.log_artifact('training_history.json', artifact_path="history")
-
 
 def search():
     import matplotlib.pyplot as plt 

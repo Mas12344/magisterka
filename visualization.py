@@ -3,41 +3,53 @@ import mlflow
 import numpy as np
 
 
-def visualize_results(results, save_path=None):
+def visualize_results(results, samples, save_path=None):
     n = len(results)
-    fig, axes = plt.subplots(n, 6, figsize=(20, 4 * n))
     
-    if n == 1:
-        axes = axes.reshape(1, -1)
+
+    n_samples = len(samples) if samples is not None else 0
+    n_cols_samples = 4
+    n_rows_samples = (n_samples + n_cols_samples - 1) // n_cols_samples if n_samples > 0 else 0
     
+
+    total_rows = n + n_rows_samples
+    
+    fig = plt.figure(figsize=(20, 4 * total_rows))
+    gs = fig.add_gridspec(total_rows, 6, hspace=0.3, wspace=0.3)
+    
+
     for i, res in enumerate(results):
         inp = res['input'].squeeze()
         inp_aug = res['input_aug'].squeeze()
         out = res['output'].squeeze()
         out_aug = res['output_aug'].squeeze()
         diff = res['difference'].squeeze()
-        # diff_aug = torch.abs(inp_aug - out_aug)
         
-        axes[i, 0].imshow(inp, cmap='viridis')
-        axes[i, 0].set_title(f'Input {i+1}', fontsize=12, fontweight='bold')
-        axes[i, 0].axis('off')
+        ax0 = fig.add_subplot(gs[i, 0])
+        ax0.imshow(inp, cmap='viridis')
+        ax0.set_title(f'Input {i+1}', fontsize=12, fontweight='bold')
+        ax0.axis('off')
         
-        axes[i, 1].imshow(inp_aug, cmap='viridis')
-        axes[i, 1].set_title(f'Input Aug {i+1}', fontsize=12, fontweight='bold')
-        axes[i, 1].axis('off')
+        ax1 = fig.add_subplot(gs[i, 1])
+        ax1.imshow(inp_aug, cmap='viridis')
+        ax1.set_title(f'Input Aug {i+1}', fontsize=12, fontweight='bold')
+        ax1.axis('off')
         
-        axes[i, 2].imshow(out, cmap='viridis')
-        axes[i, 2].set_title(f'Reconstructed {i+1}', fontsize=12, fontweight='bold')
-        axes[i, 2].axis('off')
+        ax2 = fig.add_subplot(gs[i, 2])
+        ax2.imshow(out, cmap='viridis')
+        ax2.set_title(f'Reconstructed {i+1}', fontsize=12, fontweight='bold')
+        ax2.axis('off')
         
-        axes[i, 3].imshow(out_aug, cmap='viridis')
-        axes[i, 3].set_title(f'Reconstructed Aug {i+1}', fontsize=12, fontweight='bold')
-        axes[i, 3].axis('off')
+        ax3 = fig.add_subplot(gs[i, 3])
+        ax3.imshow(out_aug, cmap='viridis')
+        ax3.set_title(f'Reconstructed Aug {i+1}', fontsize=12, fontweight='bold')
+        ax3.axis('off')
         
-        im1 = axes[i, 4].imshow(diff, cmap='hot', vmin=0)
-        axes[i, 4].set_title(f'Diff {i+1}', fontsize=12, fontweight='bold')
-        axes[i, 4].axis('off')
-        plt.colorbar(im1, ax=axes[i, 4], fraction=0.046, pad=0.04)
+        ax4 = fig.add_subplot(gs[i, 4])
+        im1 = ax4.imshow(diff, cmap='hot', vmin=0)
+        ax4.set_title(f'Diff {i+1}', fontsize=12, fontweight='bold')
+        ax4.axis('off')
+        plt.colorbar(im1, ax=ax4, fraction=0.046, pad=0.04)
         
         m = res['metrics']
         l = res['losses']
@@ -55,9 +67,10 @@ def visualize_results(results, save_path=None):
             f"  Total: {l['total']:.6f}"
         )
         
-        axes[i, 5].text(
+        ax5 = fig.add_subplot(gs[i, 5])
+        ax5.text(
             0.05, 0.5, metrics_text,
-            transform=axes[i, 5].transAxes,
+            transform=ax5.transAxes,
             fontsize=10,
             va='center',
             ha='left',
@@ -69,9 +82,27 @@ def visualize_results(results, save_path=None):
                 alpha=0.9
             )
         )
-        axes[i, 5].axis('off')
+        ax5.axis('off')
     
-    plt.tight_layout()
+
+    if samples is not None and n_samples > 0:
+        for idx, sample in enumerate(samples):
+            row = n + idx // n_cols_samples
+            col = idx % n_cols_samples
+            
+            ax_sample = fig.add_subplot(gs[row, col])
+            sample_img = sample.squeeze()
+            ax_sample.imshow(sample_img, cmap='viridis')
+            ax_sample.set_title(f'Random Sample {idx+1}', fontsize=12, fontweight='bold')
+            ax_sample.axis('off')
+        
+
+        for idx in range(n_samples, n_rows_samples * n_cols_samples):
+            row = n + idx // n_cols_samples
+            col = idx % n_cols_samples
+            if col < 6:
+                ax_empty = fig.add_subplot(gs[row, col])
+                ax_empty.axis('off')
     
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')

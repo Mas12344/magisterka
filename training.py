@@ -128,6 +128,12 @@ class BetaScheduler:
             tau = adjusted_step / adjusted_total
             beta = self.beta_start + (self.beta_end - self.beta_start) * \
                    (1 - math.exp(-5 * tau))
+
+        elif self.schedule == 'sigmoid':
+            # Sigmoid annealing
+            tau = adjusted_step / adjusted_total
+            beta = self.beta_start + (self.beta_end - self.beta_start) * \
+                   (1 / (1 + math.exp(-10 * (tau - 0.5))))
                    
         elif self.schedule == 'cosine':
             # Cosine annealing
@@ -175,6 +181,8 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
 
     mixed_precision = config.get('mixed_precision', False)
     scaler = GradScaler('cuda') if mixed_precision else None
+    
+    max_grad_norm = config.get('max_grad_norm', 1.0)
 
     mse_w = config.get('mse_weight', 1.0)
     l1_w = config.get('l1_weight', 0.1)
@@ -211,7 +219,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
     history = {k: [] for k in [
         'train_loss', 'val_loss', 'train_recon', 'train_mse', 'train_l1', 'train_fft', 'train_kl', 'train_contrastive',
         'val_recon', 'val_mse', 'val_l1', 'val_fft', 'val_kl', 'val_contrastive', 'train_psnr', 'train_mae',
-        'val_psnr', 'val_mae', 'lr', 'grad_norm', 'beta'
+        'val_psnr', 'val_mae', 'lr', 'grad_norm', 'grad_norm_unclipped', 'beta'
     ]}
 
     global_step = 0
@@ -225,7 +233,11 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         train_metrics = {'psnr': 0, 'mae': 0}
         epoch_lrs = []
         epoch_grad_norms = []
+        epoch_grad_norms_unclipped = []
         epoch_grad_similarities = []
+        epoch_mu_abs_means = []
+        epoch_mu_stds = []
+        epoch_logvar_means = []
 
         for batch_idx, data in enumerate(train_loader):
             data = data[0] if isinstance(data, (list, tuple)) else data
@@ -253,8 +265,18 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                         contrastive_temperature
                     )
                 scaler.scale(loss).backward()
+                
+                scaler.unscale_(optimizer)
+                grad_norm_unclipped = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                
                 scaler.step(optimizer)
                 scaler.update()
+                
+                mu_abs_mean = torch.mean(torch.abs(mu)).item()
+                mu_std = torch.std(mu).item()
+                logvar_mean = torch.mean(logvar).item()
             else:
                 out, _, mu, logvar, proj1 = model(data, return_projection=True)
                 data_aug = augment_with_noise(data, noise_std=augmentation_noise_std)
@@ -270,7 +292,16 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                     contrastive_temperature
                 )
                 loss.backward()
+                
+                grad_norm_unclipped = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                
                 optimizer.step()
+                
+                mu_abs_mean = torch.mean(torch.abs(mu)).item()
+                mu_std = torch.std(mu).item()
+                logvar_mean = torch.mean(logvar).item()
 
             current_grad = flatten_grads(model.parameters())
             grad_norm = current_grad.norm().item()
@@ -292,6 +323,10 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             current_lr = optimizer.param_groups[0]['lr']
             epoch_lrs.append(current_lr)
             epoch_grad_norms.append(grad_norm)
+            epoch_grad_norms_unclipped.append(grad_norm_unclipped)
+            epoch_mu_abs_means.append(mu_abs_mean)
+            epoch_mu_stds.append(mu_std)
+            epoch_logvar_means.append(logvar_mean)
 
             step_metrics = {
                 "step/train_loss": parts.get("total", loss.item()),
@@ -305,7 +340,11 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
                 "step/train_mae": metrics["mae"],
                 "step/lr": current_lr,
                 "step/grad_norm": grad_norm,
+                "step/grad_norm_unclipped": grad_norm_unclipped,
                 "step/beta" : current_beta,
+                "step/mu_abs_mean": mu_abs_mean,
+                "step/mu_std": mu_std,
+                "step/logvar_mean": logvar_mean,
             }
 
             if grad_similarity is not None:
@@ -316,6 +355,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
 
             prev_grad = current_grad.detach().clone()
             global_step += 1
+            beta_sch.step()
 
 
         scheduler.step()
@@ -324,6 +364,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         avg_metrics = {k: v / n for k, v in train_metrics.items()}
         avg_lr = sum(epoch_lrs)/n
         avg_grad_norm = sum(epoch_grad_norms)/n
+        avg_grad_norm_unclipped = sum(epoch_grad_norms_unclipped)/n
 
         history['train_loss'].append(avg_train['total'])
         history['train_recon'].append(avg_train['recon'])
@@ -336,6 +377,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         history['train_mae'].append(avg_metrics['mae'])
         history['lr'].append(avg_lr)
         history['grad_norm'].append(avg_grad_norm)
+        history['grad_norm_unclipped'].append(avg_grad_norm_unclipped)
 
 
         val_results = validate(model, val_loader, mse_w, l1_w, fft_w, current_beta, con_w, contrastive_temperature, augmentation_noise_std, device, mixed_precision)
@@ -347,7 +389,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             mlflow.log_artifact(path, artifact_path="checkpoints")
 
         
-        beta_sch.step()
+        
 
         for k, v in val_results.items():
             history[k].append(v)
@@ -365,6 +407,10 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
             "epoch/train_mae": avg_metrics["mae"],
             "epoch/lr": avg_lr,
             "epoch/grad_norm": avg_grad_norm,
+            "epoch/grad_norm_unclipped": avg_grad_norm_unclipped,
+            "epoch/mu_abs_mean": sum(epoch_mu_abs_means) / n,
+            "epoch/mu_std": sum(epoch_mu_stds) / n,
+            "epoch/logvar_mean": sum(epoch_logvar_means) / n,
             "epoch/val_loss": val_results["val_loss"],
             "epoch/val_recon": val_results["val_recon"],
             "epoch/val_mse": val_results["val_mse"],
@@ -402,7 +448,7 @@ def train_autoencoder(model, train_loader, val_loader, config, device):
         writer.close()
 
     print("training completed")
-    return history
+    return history, os.path.join(checkpoint_dir, f'best_model.pth')
 
 
 def validate(model, loader, mse_w, l1_w, fft_w, kl_w, con_w, contrastive_temperature, augmentation_noise_std, device, mixed_precision):

@@ -83,7 +83,7 @@ def nt_xent_loss(z1, z2, temperature=0.5):
 
 def vae_loss(pred, target, mu, logvar, mse_weight=1.0, l1_weight=1.0, fft_weight=1.0, kl_weight=0.5, contrastive_weight=0.1, z1=None, z2=None, temperature=0.5):
     recon_loss, stats = combined_loss(pred, target, mse_weight, l1_weight, fft_weight)
-    kl_loss = -.5 * torch.sum(1+logvar - mu.pow(2) - logvar.exp())
+    kl_loss = -.5 * torch.mean(1+logvar - mu.pow(2) - logvar.exp())
     
     if contrastive_weight > 0 and z1 is not None and z2 is not None:
         contrastive_loss = nt_xent_loss(z1, z2, temperature)

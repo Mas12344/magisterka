@@ -50,3 +50,16 @@ def run_inference_with_metrics(model, loader, config, device="cuda", max_batches
                 'latent': latent[0].cpu(),
             })
     return results
+
+
+def sample_random(model, config, device="cuda"):
+    model.eval()
+    model.to(device)
+    
+    latent_dim = config.get('latent_dim', 2048)
+    
+    with torch.no_grad():
+        z = torch.randn(1, latent_dim, device=device)
+        sample = model.decode(z)
+    
+    return sample.cpu()
